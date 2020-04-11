@@ -55,22 +55,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     var dashboardWindowController: ClashWebViewWindowController?
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
+    func applicationWillFinishLaunching(_ notification: Notification) {
         signal(SIGPIPE, SIG_IGN)
         checkOnlyOneClashX()
+        // crash recorder
+        failLaunchProtect()
+        registCrashLogger()
+    }
 
+    func applicationDidFinishLaunching(_ notification: Notification) {
         // setup menu item first
         statusItem = NSStatusBar.system.statusItem(withLength: statusItemLengthWithSpeed)
-        statusItem.menu = statusMenu
 
         statusItemView = StatusItemView.create(statusItem: statusItem)
         statusItemView.frame = CGRect(x: 0, y: 0, width: statusItemLengthWithSpeed, height: 22)
         statusMenu.delegate = self
+        setupStatusMenuItemData()
 
-        // crash recorder
-        failLaunchProtect()
-        registCrashLogger()
+        DispatchQueue.main.async {
+            self.postFinishLaunching()
+        }
+    }
 
+    func postFinishLaunching() {
+        defer {
+            statusItem.menu = statusMenu
+        }
         setupExperimentalMenuItem()
 
         // install proxy helper
@@ -110,9 +120,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         UserDefaults.standard.set(0, forKey: "launch_fail_times")
     }
 
-    func setupData() {
-        remoteConfigAutoupdateMenuItem.state = RemoteConfigManager.autoUpdateEnable ? .on : .off
-
+    func setupStatusMenuItemData() {
         ConfigManager.shared
             .showNetSpeedIndicatorObservable
             .bind { [weak self] show in
@@ -122,7 +130,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self.statusItem.length = statusItemLength
                 self.statusItemView.frame.size.width = statusItemLength
                 self.statusItemView.showSpeedContainer(show: show ?? true)
-                self.statusItemView.updateStatusItemView()
+            }.disposed(by: disposeBag)
+
+        statusItemView.updateViewStatus(enableProxy: ConfigManager.shared.proxyPortAutoSet)
+
+        LaunchAtLogin.shared
+            .isEnableVirable
+            .asObservable()
+            .subscribe(onNext: { [weak self] enable in
+                guard let self = self else { return }
+                self.autoStartMenuItem.state = enable ? .on : .off
+            }).disposed(by: disposeBag)
+
+        remoteConfigAutoupdateMenuItem.state = RemoteConfigManager.autoUpdateEnable ? .on : .off
+    }
+
+    func setupData() {
+        ConfigManager.shared
+            .showNetSpeedIndicatorObservable.skip(1)
+            .bind {
+                _ in
+                ApiRequest.shared.resetTrafficStreamApi()
             }.disposed(by: disposeBag)
 
         Observable
@@ -186,34 +214,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .bind { _ in
                 MenuItemFactory.refreshMenuItems()
             }.disposed(by: disposeBag)
-
-        LaunchAtLogin.shared
-            .isEnableVirable
-            .asObservable()
-            .subscribe(onNext: { [weak self] enable in
-                guard let self = self else { return }
-                self.autoStartMenuItem.state = enable ? .on : .off
-            }).disposed(by: disposeBag)
     }
 
     func checkOnlyOneClashX() {
-        if NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "").count > 1 {
+        let runningCount = NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "").count
+        if runningCount > 1 {
+            Logger.log("running count => \(runningCount), exit")
             assertionFailure()
             NSApp.terminate(nil)
         }
     }
 
     func setupNetworkNotifier() {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            Thread {
-                NetworkChangeNotifier.start()
-            }.start()
-        }
+        NetworkChangeNotifier.start()
 
         NotificationCenter
             .default
             .rx
-            .notification(kSystemNetworkStatusDidChange)
+            .notification(.systemNetworkStatusDidChange)
             .observeOn(MainScheduler.instance)
             .delay(.milliseconds(200), scheduler: MainScheduler.instance)
             .bind { _ in
@@ -230,6 +248,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self, selector: #selector(resetProxySettingOnWakeupFromSleep),
             name: NSWorkspace.didWakeNotification, object: nil
         )
+
+        NotificationCenter
+            .default
+            .rx
+            .notification(.systemNetworkStatusIPUpdate)
+            .observeOn(MainScheduler.instance).debounce(.seconds(5), scheduler: MainScheduler.instance).bind { [weak self] _ in
+                self?.healthHeckOnNetworkChange()
+            }.disposed(by: disposeBag)
 
         ConfigManager.shared
             .isProxySetByOtherVariable
@@ -281,7 +307,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         for item in logLevelMenuItem.submenu?.items ?? [] {
             item.state = item.title.lowercased() == ConfigManager.selectLoggingApiLevel.rawValue ? .on : .off
         }
-        NotificationCenter.default.post(name: kReloadDashboard, object: nil)
+        NotificationCenter.default.post(name: .reloadDashboard, object: nil)
     }
 
     func startProxy() {
@@ -362,7 +388,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     ConfigManager.selectConfigName = newConfigName
                 }
                 self.selectProxyGroupWithMemory()
-                NotificationCenter.default.post(name: kReloadDashboard, object: nil)
+                NotificationCenter.default.post(name: .reloadDashboard, object: nil)
             }
         }
     }
@@ -394,6 +420,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             Logger.log("Resting proxy setting, current:\(rawProxy)", level: .warning)
             SystemProxyManager.shared.disableProxy()
             SystemProxyManager.shared.enableProxy()
+        }
+    }
+
+    @objc func healthHeckOnNetworkChange() {
+        guard NetworkChangeNotifier.getPrimaryIPAddress() != nil else { return }
+        ApiRequest.requestProxyGroupList {
+            res in
+            for group in res.proxyGroups {
+                if group.type.isAutoGroup {
+                    Logger.log("Start Auto Health check for \(group.name)")
+                    ApiRequest.healthCheck(proxy: group.name)
+                }
+            }
         }
     }
 }

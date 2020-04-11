@@ -18,12 +18,12 @@ CGO_LDFLAGS=-mmacosx-version-min=10.10 \
 GOBUILD=CGO_ENABLED=0 \
 go build -ldflags '-X "github.com/Dreamacro/clash/constant.Version={version}" \
 -X "github.com/Dreamacro/clash/constant.BuildTime={build_time}"' \
--buildmode=c-archive """
+-buildmode=c-archive -o goClash.a """
     subprocess.check_output(command, shell=True)
 
 
 def write_to_info(version):
-    path = "info.plist"
+    path = "../info.plist"
 
     with open(path, 'rb') as f:
         contents = plistlib.load(f)
