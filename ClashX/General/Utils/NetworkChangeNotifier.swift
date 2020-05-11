@@ -88,21 +88,28 @@ class NetworkChangeNotifier {
     }
 
     static func getPrimaryInterface() -> String? {
-        let key: CFString
-        let store: SCDynamicStore?
-        let dict: [String: String]?
-
-        store = SCDynamicStoreCreate(nil, "ClashX" as CFString, nil, nil)
+        let store = SCDynamicStoreCreate(nil, "ClashX" as CFString, nil, nil)
         if store == nil {
             return nil
         }
 
-        key = SCDynamicStoreKeyCreateNetworkGlobalEntity(nil, kSCDynamicStoreDomainState, kSCEntNetIPv4)
-        dict = SCDynamicStoreCopyValue(store, key) as? [String: String]
+        let key = SCDynamicStoreKeyCreateNetworkGlobalEntity(nil, kSCDynamicStoreDomainState, kSCEntNetIPv4)
+        let dict = SCDynamicStoreCopyValue(store, key) as? [String: String]
         return dict?[kSCDynamicStorePropNetPrimaryInterface as String]
     }
 
-    static func getPrimaryIPAddress() -> String? {
+    static func getCurrentDns() -> [String] {
+        let store = SCDynamicStoreCreate(nil, "ClashX" as CFString, nil, nil)
+        if store == nil {
+            return []
+        }
+
+        let key = SCDynamicStoreKeyCreateNetworkGlobalEntity(nil, kSCDynamicStoreDomainState, kSCEntNetDNS)
+        let dnsArr = SCDynamicStoreCopyValue(store, key) as? [String: [String]]
+        return dnsArr?[kSCPropNetDNSServerAddresses as String] ?? []
+    }
+
+    static func getPrimaryIPAddress(allowIPV6: Bool = false) -> String? {
         guard let primary = getPrimaryInterface() else {
             return nil
         }
@@ -141,6 +148,6 @@ class NetworkChangeNotifier {
                 }
             }
         }
-        return ipv6
+        return allowIPV6 ? ipv6 : nil
     }
 }

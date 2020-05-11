@@ -53,6 +53,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItemView: StatusItemView!
     var isSpeedTesting = false
 
+    var runAfterConfigReload: (() -> Void)?
+
     var dashboardWindowController: ClashWebViewWindowController?
 
     func applicationWillFinishLaunching(_ notification: Notification) {
@@ -85,7 +87,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // install proxy helper
         _ = ClashResourceManager.check()
-        SystemProxyManager.shared.checkInstall()
+        PrivilegedHelperManager.shared.checkInstall()
         ConfigFileManager.copySampleConfigIfNeed()
 
         PFMoveToApplicationsFolderIfNecessary()
@@ -94,7 +96,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         removeUnExistProxyGroups()
 
         // start proxy
+        initClashCore()
         setupData()
+        runAfterConfigReload = { [weak self] in
+            self?.selectOutBoundModeWithMenory()
+            self?.selectAllowLanWithMenory()
+        }
         updateConfig(showNotification: false)
         updateLoggingLevel()
 
@@ -111,12 +118,47 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupNetworkNotifier()
     }
 
-    func applicationWillTerminate(_ aNotification: Notification) {
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let group = DispatchGroup()
+        var shouldWait = false
+
         if ConfigManager.shared.proxyPortAutoSet && !ConfigManager.shared.isProxySetByOtherVariable.value {
+            Logger.log("ClashX quit need clean proxy setting")
+            shouldWait = true
+            group.enter()
             let port = ConfigManager.shared.currentConfig?.port ?? 0
             let socketPort = ConfigManager.shared.currentConfig?.socketPort ?? 0
-            SystemProxyManager.shared.disableProxy(port: port, socksPort: socketPort)
+            SystemProxyManager.shared.disableProxy(port: port, socksPort: socketPort) {
+                group.leave()
+            }
         }
+
+        if !shouldWait {
+            Logger.log("ClashX quit without clean waiting")
+            return .terminateNow
+        }
+
+        if statusItem != nil, statusItem.menu != nil {
+            statusItem.menu = nil
+        }
+        disposeBag = DisposeBag()
+
+        DispatchQueue.global(qos: .default).async {
+            let res = group.wait(timeout: .now() + 5)
+            switch res {
+            case .success:
+                Logger.log("ClashX quit after clean up finish")
+            case .timedOut:
+                Logger.log("ClashX quit after clean up timeout")
+            }
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+
+        Logger.log("ClashX quit wait for clean up")
+        return .terminateLater
+    }
+
+    func applicationWillTerminate(_ aNotification: Notification) {
         UserDefaults.standard.set(0, forKey: "launch_fail_times")
     }
 
@@ -188,10 +230,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
                 self.proxyModeMenuItem.title = "\(NSLocalizedString("Proxy Mode", comment: "")) (\(config.mode.name))"
 
-                MenuItemFactory.refreshMenuItems()
-
-                if old?.port != config.port && ConfigManager.shared.proxyPortAutoSet {
-                    SystemProxyManager.shared.enableProxy(port: config.port, socksPort: config.socketPort)
+                if old?.port != config.port || old?.socketPort != config.socketPort {
+                    Logger.log("port config updated,new: \(config.port),\(config.socketPort)")
+                    if ConfigManager.shared.proxyPortAutoSet {
+                        SystemProxyManager.shared.enableProxy(port: config.port, socksPort: config.socketPort)
+                    }
                 }
 
                 self.httpPortMenuItem.title = "Http Port: \(config.port)"
@@ -199,20 +242,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self.apiPortMenuItem.title = "Api Port: \(ConfigManager.shared.apiPort)"
                 self.ipMenuItem.title = "IP: \(NetworkChangeNotifier.getPrimaryIPAddress() ?? "")"
 
-                if config.port == 0 || config.socketPort == 0 {
-                    self.showClashPortErrorAlert()
-                }
+                ClashStatusTool.checkPortConfig(cfg: config)
 
-            }.disposed(by: disposeBag)
-
-        ConfigManager
-            .shared
-            .isRunningVariable
-            .asObservable()
-            .distinctUntilChanged()
-            .filter { $0 }
-            .bind { _ in
-                MenuItemFactory.refreshMenuItems()
             }.disposed(by: disposeBag)
     }
 
@@ -252,8 +283,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NotificationCenter
             .default
             .rx
-            .notification(.systemNetworkStatusIPUpdate)
-            .observeOn(MainScheduler.instance).debounce(.seconds(5), scheduler: MainScheduler.instance).bind { [weak self] _ in
+            .notification(.systemNetworkStatusIPUpdate).map({ _ in
+                NetworkChangeNotifier.getPrimaryIPAddress(allowIPV6: false)
+            })
+            .startWith(NetworkChangeNotifier.getPrimaryIPAddress(allowIPV6: false))
+            .distinctUntilChanged()
+            .skip(1)
+            .filter { $0 != nil }
+            .observeOn(MainScheduler.instance)
+            .debounce(.seconds(5), scheduler: MainScheduler.instance).bind { [weak self] _ in
                 self?.healthHeckOnNetworkChange()
             }.disposed(by: disposeBag)
 
@@ -267,16 +305,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 Logger.log("proxy changed to no clashX setting: \(rawProxy)", level: .warning)
                 NSUserNotificationCenter.default.postProxyChangeByOtherAppNotice()
             }.disposed(by: disposeBag)
-    }
-
-    func updateProxyList() {
-        if ConfigManager.shared.isRunning {
-            MenuItemFactory.refreshMenuItems { [weak self] items in
-                self?.updateProxyList(withMenus: items)
-            }
-        } else {
-            updateProxyList(withMenus: [])
-        }
     }
 
     func updateProxyList(withMenus menus: [NSMenuItem]) {
@@ -376,8 +404,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             } else {
                 self.syncConfig()
                 self.resetStreamApi()
-                self.selectOutBoundModeWithMenory()
-                self.selectAllowLanWithMenory()
+                self.runAfterConfigReload?()
+                self.runAfterConfigReload = nil
                 if showNotification {
                     NSUserNotificationCenter.default
                         .post(title: NSLocalizedString("Reload Config Succeed", comment: ""),
@@ -388,6 +416,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     ConfigManager.selectConfigName = newConfigName
                 }
                 self.selectProxyGroupWithMemory()
+                MenuItemFactory.recreateProxyMenuItems()
                 NotificationCenter.default.post(name: .reloadDashboard, object: nil)
             }
         }
@@ -424,7 +453,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func healthHeckOnNetworkChange() {
-        guard NetworkChangeNotifier.getPrimaryIPAddress() != nil else { return }
         ApiRequest.requestProxyGroupList {
             res in
             for group in res.proxyGroups {
@@ -481,6 +509,7 @@ extension AppDelegate {
         ApiRequest.updateOutBoundMode(mode: mode) { success in
             ConfigManager.shared.currentConfig = config
             ConfigManager.selectOutBoundMode = mode
+            MenuItemFactory.recreateProxyMenuItems()
         }
     }
 
@@ -533,19 +562,27 @@ extension AppDelegate {
         NSUserNotificationCenter.default.postSpeedTestBeginNotice()
 
         isSpeedTesting = true
-        ApiRequest.getAllProxyList { [weak self] proxies in
-            let testGroup = DispatchGroup()
 
-            for proxyName in proxies {
-                testGroup.enter()
-                ApiRequest.getProxyDelay(proxyName: proxyName) { delay in
-                    testGroup.leave()
+        ApiRequest.getMergedProxyData { [weak self] resp in
+            let group = DispatchGroup()
+
+            for (name, _) in resp?.enclosingProviderResp?.providers ?? [:] {
+                group.enter()
+                ApiRequest.healthCheck(proxy: name) {
+                    group.leave()
                 }
             }
-            testGroup.notify(queue: DispatchQueue.main, execute: {
+
+            for p in resp?.proxiesMap["GLOBAL"]?.all ?? [] {
+                group.enter()
+                ApiRequest.getProxyDelay(proxyName: p) { _ in
+                    group.leave()
+                }
+            }
+            group.notify(queue: DispatchQueue.main) {
                 NSUserNotificationCenter.default.postSpeedTestFinishNotice()
                 self?.isSpeedTesting = false
-            })
+            }
         }
     }
 
@@ -730,9 +767,21 @@ extension AppDelegate {
 
 extension AppDelegate: NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
-        updateProxyList()
+        MenuItemFactory.refreshExistingMenuItems()
         updateConfigFiles()
         syncConfig()
+    }
+
+    func menu(_ menu: NSMenu, willHighlight item: NSMenuItem?) {
+        menu.items.forEach {
+            ($0.view as? ProxyGroupMenuHighlightDelegate)?.highlight(item: item)
+        }
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menu.items.forEach {
+            ($0.view as? ProxyGroupMenuHighlightDelegate)?.highlight(item: nil)
+        }
     }
 }
 
@@ -768,15 +817,5 @@ extension AppDelegate {
                 NotificationCenter.default.post(name: Notification.Name(rawValue: "didGetUrl"), object: nil, userInfo: userInfo)
             }
         }
-    }
-}
-
-// MARK: - Alerts
-
-extension AppDelegate {
-    func showClashPortErrorAlert() {
-        let alert = NSAlert()
-        alert.messageText = NSLocalizedString("ClashX Start Error!", comment: "")
-        alert.informativeText = NSLocalizedString("Ports Open Fail, Please try to restart ClashX", comment: "")
     }
 }
